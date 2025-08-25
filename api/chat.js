@@ -1,31 +1,32 @@
-// /api/chat.js — серверless-функция для Vercel
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
+
 export default async function handler(req, res) {
-  // --- CORS ---
-  const origin = req.headers.origin || "";
-  const allowedOrigins = [
-    "https://dn-remstroy.ru",
-    "https://www.dn-remstroy.ru",
-    // если страница пока на tilda.ws — добавьте точный адрес:
-    // "https://<your-project>.tilda.ws"
-  ];
-  if (allowedOrigins.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  }
-  res.setHeader("Vary", "Origin");
+  // Разрешаем CORS для Tilda и вашего домена
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
+
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
   try {
-    const { messages = [], system, temperature = 0.2, model = "gpt-4o-mini" } = req.body || {};
-    const finalMessages = [];
-    // Задаём системную роль (тон и контекст помощника)
-    finalMessages.push({
-      role: "system",
-      content:
-        system ||
-        'Ты — Николай, онлайн-помощник компании ДН-Ремстрой (г. Астрахань). 
+    const { messages, model = "gpt-4o-mini" } = req.body;
+
+    // Добавляем системный промт
+    const finalMessages = [
+      {
+        role: "system",
+        content: `
+Ты — Николай, онлайн-помощник компании ДН-Ремстрой (г. Астрахань). 
 Твоя роль — вежливо и профессионально консультировать клиентов по ремонту квартир, домов и офисов.
 
 🎯 Главные задачи:
@@ -68,44 +69,31 @@ A: Базовый ремонт от 7 000 руб/м², капитальный о
 - Давать точные цены без уточнения деталей (говори только ориентиры).
 - Давать личные советы, не относящиеся к ремонту.
 
-Всегда завершай ответ мягким предложением оставить заявку, позвонить или написать в мессенджеры.'
-    });
-    if (Array.isArray(messages)) finalMessages.push(...messages);
-
-    // Запрос к OpenAI (стрим)
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
+Всегда завершай ответ мягким предложением оставить заявку, позвонить или написать в мессенджеры.
+`
       },
-      body: JSON.stringify({
-        model,
-        temperature,
-        stream: true,
-        messages: finalMessages
-      })
+      ...(messages || [])
+    ];
+
+    // Делаем стриминг
+    const completion = await client.chat.completions.create({
+      model,
+      messages: finalMessages,
+      stream: true
     });
 
-    if (!r.ok || !r.body) {
-      const text = await r.text().catch(() => "Upstream error");
-      return res.status(500).json({ error: text });
-    }
-
-    // Проксируем поток клиенту (SSE)
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
 
-    const reader = r.body.getReader();
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (value) res.write(value);
+    for await (const chunk of completion) {
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     }
+    res.write("data: [DONE]\n\n");
     res.end();
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Server error" });
+
+  } catch (error) {
+    console.error("Chat API error:", error);
+    res.status(500).json({ error: error.message || "Internal server error" });
   }
 }
