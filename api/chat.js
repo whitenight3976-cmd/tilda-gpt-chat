@@ -1,31 +1,40 @@
-import OpenAI from "openai";
+// /api/chat.js — Vercel Serverless Function, без внешних зависимостей
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+// Читаем JSON-тело запроса безопасно (Vercel/Node)
+async function readJsonBody(req) {
+  return new Promise((resolve) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try { resolve(JSON.parse(body || "{}")); }
+      catch { resolve({}); }
+    });
+  });
+}
 
 export default async function handler(req, res) {
-  // Разрешаем CORS для Tilda и вашего домена
+  // --- CORS (можете ограничить до вашего домена) ---
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
+  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+  // --- Проверка ключа ---
+  const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+  if (!OPENAI_API_KEY) {
+    return res.status(500).json({ error: "Missing OPENAI_API_KEY env var" });
   }
 
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  // --- Читаем payload от клиента ---
+  const payload = await readJsonBody(req);
+  const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+  const model = payload?.model || "gpt-4o-mini";
+  const temperature = typeof payload?.temperature === "number" ? payload.temperature : 0.2;
 
-  try {
-    const { messages, model = "gpt-4o-mini" } = req.body;
-
-    // Добавляем системный промт
-    const finalMessages = [
-      {
-        role: "system",
-        content: `
+  // --- System Prompt (шаблонная строка!) ---
+  const SYSTEM_PROMPT = `
 Ты — Николай, онлайн-помощник компании ДН-Ремстрой (г. Астрахань). 
 Твоя роль — вежливо и профессионально консультировать клиентов по ремонту квартир, домов и офисов.
 
@@ -70,30 +79,45 @@ A: Базовый ремонт от 7 000 руб/м², капитальный о
 - Давать личные советы, не относящиеся к ремонту.
 
 Всегда завершай ответ мягким предложением оставить заявку, позвонить или написать в мессенджеры.
-`
-      },
-      ...(messages || [])
-    ];
+`.trim();
 
-    // Делаем стриминг
-    const completion = await client.chat.completions.create({
-      model,
-      messages: finalMessages,
-      stream: true
+  const finalMessages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    ...messages
+  ];
+
+  try {
+    // --- Запрос к OpenAI с потоковой отдачей ---
+    const upstream = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model,
+        temperature,
+        stream: true,
+        messages: finalMessages
+      })
     });
 
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
+    if (!upstream.ok || !upstream.body) {
+      const text = await upstream.text().catch(() => "Upstream error");
+      return res.status(502).json({ error: text });
+    }
+
+    // --- Проксируем поток SSE как есть ---
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
 
-    for await (const chunk of completion) {
-      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    for await (const chunk of upstream.body) {
+      res.write(chunk);
     }
-    res.write("data: [DONE]\n\n");
     res.end();
-
-  } catch (error) {
-    console.error("Chat API error:", error);
-    res.status(500).json({ error: error.message || "Internal server error" });
+  } catch (err) {
+    console.error("Server error:", err);
+    res.status(500).json({ error: "Server error" });
   }
 }
