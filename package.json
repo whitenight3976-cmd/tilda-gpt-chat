@@ -1,0 +1,6 @@
+{
+  "name": "dn-remstroy-gpt-chat",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=18" }
+}
